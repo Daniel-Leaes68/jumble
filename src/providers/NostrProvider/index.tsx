@@ -19,6 +19,7 @@ import { getProfileFromEvent, getRelayListFromEvent } from '@/lib/event-metadata
 import { formatPubkey, pubkeyToNpub } from '@/lib/pubkey'
 import { getDefaultRelayUrls } from '@/lib/relay'
 import { isSameAccount } from '@/lib/account'
+import { startOwnEventSync } from '@/lib/own-event-sync'
 import client from '@/services/client.service'
 import customEmojiService from '@/services/custom-emoji.service'
 import dmService from '@/services/dm.service'
@@ -194,6 +195,7 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const controller = new AbortController()
+    let ownEventSync: ReturnType<typeof startOwnEventSync> | undefined
     const init = async () => {
       setRelayList(null)
       setProfile(null)
@@ -396,10 +398,74 @@ export function NostrProvider({ children }: { children: React.ReactNode }) {
       storage.setLastReadNotificationTime(account.pubkey, notificationsSeenAt)
 
       client.initUserIndexFromFollowings(account.pubkey, controller.signal)
+
+      // Subscribe after hydration so its snapshot cannot overwrite live state.
+      // No `since`: relays replay their latest replaceable events, closing the
+      // gap between the initial fetch and opening this persistent subscription.
+      if (controller.signal.aborted) return
+      ownEventSync = startOwnEventSync({
+        pubkey: account.pubkey,
+        relayUrls: [...defaultRelays, ...relayList.read, ...relayList.write],
+        subscribe: (urls, filters, handlers) => client.subscribe(urls, filters, handlers),
+        persist: (event) => indexedDb.putReplaceableEvent(event),
+        onError: (error) => console.error('Failed to synchronize account state:', error),
+        apply: async (event, isActive) => {
+          if (!isActive()) return
+          switch (event.kind) {
+            case kinds.RelayList: {
+              const latest = await client.updateRelayListCache(event)
+              if (!isActive()) return
+              const next = getRelayListFromEvent(latest, storage.getFilterOutOnionRelays())
+              setRelayList(next)
+              ownEventSync?.setRelayUrls([...defaultRelays, ...next.read, ...next.write])
+              break
+            }
+            case kinds.Metadata:
+              setProfileEvent(event)
+              setProfile(getProfileFromEvent(event))
+              break
+            case kinds.Contacts:
+              await client.updateFollowListCache(event)
+              if (isActive()) setFollowListEvent(event)
+              break
+            case kinds.Mutelist:
+              setMuteListEvent(event)
+              break
+            case kinds.BookmarkList:
+              setBookmarkListEvent(event)
+              break
+            case ExtendedKind.FAVORITE_RELAYS:
+              setFavoriteRelaysEvent(event)
+              break
+            case ExtendedKind.BLOSSOM_SERVER_LIST:
+              await client.updateBlossomServerListEventCache(event)
+              break
+            case kinds.UserEmojiList:
+              setUserEmojiListEvent(event)
+              break
+            case kinds.Pinlist:
+              setPinListEvent(event)
+              break
+            case ExtendedKind.PINNED_USERS:
+              setPinnedUsersEvent(event)
+              break
+            case kinds.Application: {
+              const seenAt = Math.max(
+                storage.getLastReadNotificationTime(account.pubkey),
+                event.created_at
+              )
+              storage.setLastReadNotificationTime(account.pubkey, seenAt)
+              setNotificationsSeenAt((previous) => Math.max(previous, seenAt))
+              break
+            }
+          }
+        }
+      })
     }
     init()
     return () => {
       controller.abort()
+      ownEventSync?.close()
     }
   }, [account])
 
